@@ -10,6 +10,7 @@ import math
 import time
 from typing import Any
 
+from .bandit import UCBBandit, ThompsonSamplingBandit
 from .base import CyberneticsEvent, EventType, ICyberneticsModule
 from .parameter_state import ParameterState
 
@@ -71,6 +72,21 @@ class AdaptiveTuner(ICyberneticsModule):
         self._topic_weights: dict[str, float] = {}  # topic -> 权重
         self._user_feedback: list[dict[str, Any]] = []
         self._banned_tools: set = set()
+
+        # Bandit-based exploration for parameter tuning
+        bandit_config = config.get("bandit", {})
+        if bandit_config.get("enabled", True):
+            bandit_algorithm = bandit_config.get("algorithm", "ucb")
+            exploration_params = [
+                p["name"] for p in config.get("parameters", [])
+                if isinstance(p.get("base"), (int, float))
+            ]
+            if bandit_algorithm == "thompson":
+                self._bandit = ThompsonSamplingBandit(exploration_params) if exploration_params else None
+            else:
+                self._bandit = UCBBandit(exploration_params) if exploration_params else None
+        else:
+            self._bandit = None
 
     def on_event(self, event: CyberneticsEvent) -> CyberneticsEvent | None:
         """处理事件，更新学习状态。"""
@@ -300,13 +316,48 @@ class AdaptiveTuner(ICyberneticsModule):
         调整数值型参数。
 
         策略：
+        - 使用 Bandit 算法（UCB/Thompson Sampling）做探索/利用均衡
         - 工具成功率高 → 提高并发/规模
         - 工具成功率低 → 降低并发/规模，增加保守性
-        - 10% 概率做探索性尝试
+        - 降级方案：ε-greedy 探索
         """
         import random
 
-        # ε-greedy 探索
+        # Bandit-based directed exploration (preferred)
+        if self._bandit is not None and name in self._bandit.arms:
+            # Determine if this parameter should be explored or exploited
+            avg_score = sum(self._tool_scores.values()) / len(self._tool_scores) if self._tool_scores else 0.5
+
+            # Use bandit to decide exploration direction
+            # The "arm" represents the direction: increase, decrease, return_to_base
+            if not hasattr(self, '_param_directions'):
+                self._param_directions: dict[str, list[str]] = {}
+            if name not in self._param_directions:
+                self._param_directions[name] = ["increase", "decrease", "base"]
+
+            direction_bandit = UCBBandit(self._param_directions[name])
+            # Seed with previous tool scores as pseudo-rewards
+            for d in self._param_directions[name]:
+                direction_bandit.update(d, avg_score if d == "increase" else 1.0 - avg_score)
+
+            chosen = direction_bandit.select()
+            current = ps.current_value if isinstance(ps.current_value, (int, float)) else ps.base_value
+
+            if chosen == "increase":
+                delta = (ps.max_value - ps.min_value) * 0.15 * self._learning_rate
+                new_val = current + delta
+            elif chosen == "decrease":
+                delta = (ps.max_value - ps.min_value) * 0.15 * self._learning_rate
+                new_val = current - delta
+            else:  # base
+                new_val = current + (ps.base_value - current) * self._learning_rate * 0.3
+
+            # Update bandit reward based on outcome (deferred: applied after result observed)
+            if isinstance(ps.base_value, int):
+                return int(max(ps.min_value, min(ps.max_value, new_val)))
+            return max(ps.min_value, min(ps.max_value, new_val))
+
+        # Fallback: ε-greedy exploration
         if random.random() < 0.1:
             if isinstance(ps.base_value, int):
                 return random.randint(int(ps.min_value), int(ps.max_value))

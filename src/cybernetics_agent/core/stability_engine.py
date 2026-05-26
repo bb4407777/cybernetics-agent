@@ -136,7 +136,7 @@ class StabilityEngine(ICyberneticsModule):
             )
         return self._circuit_breakers[name]
 
-    def with_timeout(
+    async def with_timeout(
         self,
         func: Callable[..., Any],
         timeout_type: str = "default",
@@ -146,14 +146,24 @@ class StabilityEngine(ICyberneticsModule):
         """
         带超时控制的函数调用。
 
-        支持同步函数（使用线程）和异步函数（使用 asyncio）。
+        支持同步函数（使用线程池）和异步函数（使用 asyncio.wait_for）。
         """
         timeout = self._timeouts.get(timeout_type, self._timeouts["default"])
 
         if asyncio.iscoroutinefunction(func):
-            return self._async_with_timeout(func, timeout, *args, **kwargs)
+            return await self._async_with_timeout(func, timeout, *args, **kwargs)
         else:
-            return self._sync_with_timeout(func, timeout, *args, **kwargs)
+            loop = asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                try:
+                    return await asyncio.wait_for(
+                        loop.run_in_executor(executor, lambda: func(*args, **kwargs)),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    self._timeout_count += 1
+                    raise TimeoutError(f"函数执行超时（限制 {timeout}秒）")
 
     def _sync_with_timeout(
         self,
@@ -173,17 +183,22 @@ class StabilityEngine(ICyberneticsModule):
                 self._timeout_count += 1
                 raise TimeoutError(f"函数执行超时（限制 {timeout}秒）") from err
 
-    def _async_with_timeout(
+    async def _async_with_timeout(
         self,
         func: Callable[..., Any],
         timeout: float,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """异步函数的超时控制。"""
-        # 注: 实际使用时需要在 async 环境中调用
-        # 这里只做简单检查
-        return func(*args, **kwargs)
+        """异步函数的超时控制。
+
+        使用 asyncio.wait_for 对异步协程施加超时限制。
+        """
+        try:
+            return await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._timeout_count += 1
+            raise TimeoutError(f"异步函数执行超时（限制 {timeout}秒）")
 
     def with_retry(
         self,
